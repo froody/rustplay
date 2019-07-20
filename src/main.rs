@@ -1,8 +1,11 @@
 use std::cmp::min;
 use std::collections::{HashMap, HashSet};
 use std::env;
+use std::thread::{spawn, JoinHandle};
 use std::fs::File;
-use std::io::{self, BufRead, BufReader, Read};
+use std::io::{self, BufRead, BufReader};
+use std::time::{Duration, Instant};
+
 
 extern crate byteorder;
 extern crate istring;
@@ -11,12 +14,86 @@ extern crate itertools;
 use byteorder::{LittleEndian, ReadBytesExt};
 use istring::IString;
 
+type FileList =  Vec<Vec<u32>>;
+
 #[derive(Default)]
 struct Files {
     strings: Vec<IString>,
     strings_map: HashMap<IString, u32>,
-    files: Vec<Vec<u32>>,
-    files_rev: Vec<Vec<u32>>,
+    files: FileList,
+    files_rev: FileList,
+}
+
+fn sort_vec32(list: &mut FileList)
+{
+    list.sort_by(|a: &Vec<u32>, b: &Vec<u32>| {
+        let alen = a.len();
+        let blen = b.len();
+        for i in 0..min(alen, blen) {
+            if a[i] == b[i] {
+                continue;
+            } else {
+                return a[i].cmp(&b[i]);
+            }
+        }
+
+        return alen.cmp(&blen);
+    });
+}
+
+impl Files {
+    fn new(
+        strings: Vec<IString>,
+        strings_map: HashMap<IString, u32>,
+        files: FileList,
+    ) -> Files {
+        eprintln!("loaded!");
+
+        let files_rev = files
+            .iter()
+            .map(|f| {
+                let mut ret = f.clone();
+                ret.reverse();
+                ret
+            })
+            .collect();
+
+        eprintln!("reversed!");
+        let before = Instant::now();
+
+       let slice = vec![files, files_rev];
+       type JH = JoinHandle<FileList>;
+
+       let threads : Vec<JH> = slice.into_iter().map(move |mut arg| -> JH {
+            spawn(move || -> FileList {
+            let tbef = Instant::now();
+            sort_vec32(&mut arg);
+            eprintln!("sorted a {}", tbef.elapsed().as_millis());
+            arg
+        })
+       }).collect();
+
+       let mut result: Vec<FileList> = threads.into_iter().map(move |t| t.join().unwrap()).collect();
+       let files_rev = result.pop().unwrap();
+       let files = result.pop().unwrap();
+       // eprintln!("nothreads!");
+       // let mut files = files;
+       // let mut files_rev = files_rev;
+       // sort_vec32(&mut files);
+       // sort_vec32(&mut files_rev);
+       //let files = th1.join().unwrap();
+       //let files_rev = th2.join().unwrap();
+        
+
+        eprintln!("sorted! {}", before.elapsed().as_millis());
+
+        Files {
+            strings,
+            strings_map,
+            files,
+            files_rev,
+        }
+    }
 }
 
 fn load_file_list_from_text<'a>(filename: &String) -> Result<Files, io::Error> {
@@ -60,13 +137,7 @@ fn load_file_list_from_text<'a>(filename: &String) -> Result<Files, io::Error> {
         }
     }
 
-    let files_rev = Vec::new();
-    return Ok(Files {
-        strings,
-        strings_map,
-        files,
-        files_rev,
-    });
+    return Ok(Files::new(strings, strings_map, files));
 }
 
 fn load_file_list_from_binary<'a>(
@@ -80,12 +151,12 @@ fn load_file_list_from_binary<'a>(
     // Indices start from 1, so add dummy item
     strings.push("".into());
 
-    let filebuf = BufReader::new(File::open(filenames_path).unwrap());
+    let filebuf = BufReader::new(File::open(filenames_path)?);
     for line in filebuf.lines() {
         strings.push(line?.into());
     }
 
-    let mut filebuf = BufReader::new(File::open(files_path).unwrap());
+    let mut filebuf = BufReader::new(File::open(files_path)?);
 
     let mut file_buf: Vec<u32> = vec![];
     loop {
@@ -106,13 +177,7 @@ fn load_file_list_from_binary<'a>(
             println!("item is {:?}", string);
         }
     }
-    let files_rev = Vec::new();
-    return Ok(Files {
-        strings,
-        strings_map,
-        files,
-        files_rev
-    });
+    return Ok(Files::new(strings, strings_map, files));
 }
 
 fn common_prefix(a: &Vec<u32>, b: &Vec<u32>) -> usize {
@@ -127,35 +192,11 @@ fn decode<'a, I: Iterator<Item = &'a u32>>(item: I, strings: &Vec<IString>) -> S
 }
 
 fn load_file<'a>(args: &[String]) -> Result<Files, io::Error> {
-    let mut strings;
     if args.len() == 1 {
-        strings = load_file_list_from_text(&args[0])?;
+        return load_file_list_from_text(&args[0]);
     } else {
-        strings = load_file_list_from_binary(&args[0], &args[1])?;
+        return load_file_list_from_binary(&args[0], &args[1]);
     }
-
-    //strings.files.iter().map(|
-    strings.files_rev  = strings.files.iter().map(|f| { let mut ret = f.clone(); ret.reverse(); ret }).collect(); 
-
-    println!("reversed!");
-    for list in &mut [&mut strings.files, &mut strings.files_rev] {
-        list.sort_by(|a: &Vec<u32>, b: &Vec<u32>| {
-            let alen = a.len();
-            let blen = b.len();
-            for i in 0..min(alen, blen) {
-                if a[i] == b[i] {
-                    continue;
-                } else {
-                    return a[i].cmp(&b[i]);
-                }
-            }
-
-            return alen.cmp(&blen);
-        });
-    }
-    println!("sorted!");
-
-    Ok(strings)
 }
 
 fn print_debug_info(files: &Files) {
@@ -196,31 +237,27 @@ fn main() {
     }
 
     for (this, next) in strings.files_rev.iter().zip(&strings.files_rev[1..]) {
-            let mut last: String = strings.strings[this[0] as usize].clone().into();
-            last = last.to_lowercase();
-            if !(last.ends_with(".jpg") || last.ends_with(".jpeg")) {
-                //continue;
-            }
-            let commonlen = common_prefix(this, next);
-            if commonlen == 0 {
-                continue;
-            }
-            let entry = stats.counts.entry(commonlen).or_insert(0);
+        let mut last: String = strings.strings[this[0] as usize].clone().into();
+        last = last.to_lowercase();
+        if !(last.ends_with(".jpg") || last.ends_with(".jpeg")) {
+            //continue;
+        }
+        let commonlen = common_prefix(this, next);
+        if commonlen == 0 {
+            continue;
+        }
+        let entry = stats.counts.entry(commonlen).or_insert(0);
+        *entry += 1;
+        if commonlen > 1 {
+            let key = (
+                strings.strings[this[commonlen - 1] as usize].clone(),
+                &this[commonlen..],
+                &next[commonlen..],
+            );
+            let entry = stats.groups.entry(key.clone()).or_insert(0);
             *entry += 1;
-            if commonlen > 1 {
-                let key = (strings.strings[this[commonlen - 1] as usize].clone(),
-                        &this[commonlen..],
-                        &next[commonlen..]);
-                let entry = stats
-                    .groups
-                    .entry(key.clone())
-                    .or_insert(0);
-                *entry += 1;
-                let entry = stats
-                    .groups2
-                    .entry(key)
-                    .or_insert(HashSet::new());
-            }
+            let entry = stats.groups2.entry(key).or_insert(HashSet::new());
+        }
     }
     for item in stats.counts.iter() {
         println!("hist is {:?}", item);
@@ -235,6 +272,15 @@ fn main() {
         let mut group_names: Vec<&String> = stats.groups2[&key].iter().collect();
         group_names.sort();
         let (name, parent1, parent2) = key;
-        println!("groups is {:?}, {:?}", (&name, val, decode(parent1.iter(), &strings.strings), decode(parent2.iter(), &strings.strings)), group_names);
+        println!(
+            "groups is {:?}, {:?}",
+            (
+                &name,
+                val,
+                decode(parent1.iter(), &strings.strings),
+                decode(parent2.iter(), &strings.strings)
+            ),
+            group_names
+        );
     }
 }
