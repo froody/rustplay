@@ -1,20 +1,22 @@
-use std::cmp::min;
+use std::cmp::{min, Ordering};
 use std::collections::{HashMap, HashSet};
 use std::env;
-use std::thread::{spawn, JoinHandle};
 use std::fs::File;
 use std::io::{self, BufRead, BufReader};
+use std::thread::{spawn, JoinHandle};
 use std::time::{Duration, Instant};
-
+mod sorted_iterator;
 
 extern crate byteorder;
 extern crate istring;
 extern crate itertools;
+extern crate superslice;
 
 use byteorder::{LittleEndian, ReadBytesExt};
 use istring::IString;
+use superslice::Ext;
 
-type FileList =  Vec<Vec<u32>>;
+type FileList = Vec<Vec<u32>>;
 
 #[derive(Default)]
 struct Files {
@@ -24,30 +26,55 @@ struct Files {
     files_rev: FileList,
 }
 
-fn sort_vec32(list: &mut FileList)
+fn compare_file_entry_iters<'a, I, J>(mut a: I, mut b: J) -> Ordering
+where
+    I: Iterator<Item = &'a u32>,
+    J: Iterator<Item = &'a u32>,
 {
-    list.sort_by(|a: &Vec<u32>, b: &Vec<u32>| {
-        let alen = a.len();
-        let blen = b.len();
-        for i in 0..min(alen, blen) {
-            if a[i] == b[i] {
-                continue;
-            } else {
-                return a[i].cmp(&b[i]);
-            }
-        }
+    let mut mismatch = a.by_ref().zip(b.by_ref()).skip_while(|(x, y)| x == y);
+    match mismatch.next() {
+        Some((x, y)) => x.cmp(&y),
+        None => a.count().cmp(&b.count()),
+    }
+}
 
-        return alen.cmp(&blen);
-    });
+fn compare_file_entry(a: &Vec<u32>, b: &Vec<u32>) -> Ordering {
+    let alen = a.len();
+    let blen = b.len();
+    for i in 0..min(alen, blen) {
+        if a[i] == b[i] {
+            continue;
+        } else {
+            return a[i].cmp(&b[i]);
+        }
+    }
+
+    return alen.cmp(&blen);
+}
+
+fn sort_vec32(list: &mut FileList) {
+    list.sort_by(compare_file_entry);
 }
 
 impl Files {
-    fn new(
-        strings: Vec<IString>,
-        strings_map: HashMap<IString, u32>,
-        files: FileList,
-    ) -> Files {
+    fn new(strings: Vec<IString>, strings_map: HashMap<IString, u32>, files: FileList) -> Files {
         eprintln!("loaded!");
+
+        for i in 1..10 {
+            let mut skiplen = files.len();
+            if i < 10 {
+                skiplen /= 10;
+                skiplen *= i;
+            }
+            let before = Instant::now();
+            let mut val = files.iter().skip(skiplen);
+            let after = before.elapsed().as_nanos();
+            eprintln!("counted! {}, {:?}, {}", skiplen, val.next(), after);
+            let before = Instant::now();
+            let mut val = files.iter().rev().skip(skiplen);
+            let after = before.elapsed().as_nanos();
+            eprintln!("rcounted! {}, {:?}, {}", skiplen, val.next(), after);
+        }
 
         let files_rev = files
             .iter()
@@ -61,29 +88,34 @@ impl Files {
         eprintln!("reversed!");
         let before = Instant::now();
 
-       let slice = vec![files, files_rev];
-       type JH = JoinHandle<FileList>;
+        let slice = vec![files, files_rev];
+        type JH = JoinHandle<FileList>;
 
-       let threads : Vec<JH> = slice.into_iter().map(move |mut arg| -> JH {
-            spawn(move || -> FileList {
-            let tbef = Instant::now();
-            sort_vec32(&mut arg);
-            eprintln!("sorted a {}", tbef.elapsed().as_millis());
-            arg
-        })
-       }).collect();
+        let threads: Vec<JH> = slice
+            .into_iter()
+            .map(move |mut arg| -> JH {
+                spawn(move || -> FileList {
+                    let tbef = Instant::now();
+                    sort_vec32(&mut arg);
+                    eprintln!("sorted a {}", tbef.elapsed().as_millis());
+                    arg
+                })
+            })
+            .collect();
 
-       let mut result: Vec<FileList> = threads.into_iter().map(move |t| t.join().unwrap()).collect();
-       let files_rev = result.pop().unwrap();
-       let files = result.pop().unwrap();
-       // eprintln!("nothreads!");
-       // let mut files = files;
-       // let mut files_rev = files_rev;
-       // sort_vec32(&mut files);
-       // sort_vec32(&mut files_rev);
-       //let files = th1.join().unwrap();
-       //let files_rev = th2.join().unwrap();
-        
+        let mut result: Vec<FileList> = threads
+            .into_iter()
+            .map(move |t| t.join().unwrap())
+            .collect();
+        let files_rev = result.pop().unwrap();
+        let files = result.pop().unwrap();
+        // eprintln!("nothreads!");
+        // let mut files = files;
+        // let mut files_rev = files_rev;
+        // sort_vec32(&mut files);
+        // sort_vec32(&mut files_rev);
+        //let files = th1.join().unwrap();
+        //let files_rev = th2.join().unwrap();
 
         eprintln!("sorted! {}", before.elapsed().as_millis());
 
@@ -222,7 +254,6 @@ fn print_debug_info(files: &Files) {
 struct Stats<'a> {
     counts: HashMap<usize, u32>,
     groups: HashMap<(IString, &'a [u32], &'a [u32]), usize>,
-    groups2: HashMap<(IString, &'a [u32], &'a [u32]), HashSet<String>>,
 }
 
 fn main() {
@@ -251,12 +282,11 @@ fn main() {
         if commonlen > 1 {
             let key = (
                 strings.strings[this[commonlen - 1] as usize].clone(),
-                &this[commonlen..],
-                &next[commonlen..],
+                &this[commonlen-1..],
+                &next[commonlen-1..],
             );
             let entry = stats.groups.entry(key.clone()).or_insert(0);
             *entry += 1;
-            let entry = stats.groups2.entry(key).or_insert(HashSet::new());
         }
     }
     for item in stats.counts.iter() {
@@ -268,19 +298,88 @@ fn main() {
         .map(|(key, val)| (*val, key.clone()))
         .collect();
     ordered_groups.sort();
-    for (val, key) in ordered_groups {
-        let mut group_names: Vec<&String> = stats.groups2[&key].iter().collect();
-        group_names.sort();
+    for (val, key) in &ordered_groups {
         let (name, parent1, parent2) = key;
         println!(
-            "groups is {:?}, {:?}",
+            "groups is {:?}",
             (
                 &name,
                 val,
                 decode(parent1.iter(), &strings.strings),
                 decode(parent2.iter(), &strings.strings)
             ),
-            group_names
         );
     }
+
+    let last = ordered_groups.last().unwrap();
+    let (_, (name, parent1, parent2)) = last;
+    let mut parent1 = parent1.to_vec();
+    parent1.reverse();
+    let mut parent2 = parent2.to_vec();
+    parent2.reverse();
+
+    let left = strings.files[..].lower_bound_by(|val| compare_file_entry(&val, &parent1));
+    let right = strings.files[..].lower_bound_by(|val| compare_file_entry(&val, &parent2));
+    let left_top = strings.files[..].upper_bound_by(|val| { let prefix = &val[0..min(val.len(), parent1.len())]; compare_file_entry_iters(prefix.iter(), parent1.iter()) } );
+    let right_top = strings.files[..].upper_bound_by(|val| { let prefix = &val[0..min(val.len(), parent2.len())]; compare_file_entry_iters(prefix.iter(), parent2.iter()) } );
+    println!("found {:?}", (left, left_top, right, right_top, strings.files.len()));
+    println!("parents {:?}", ( decode(parent1.iter(), &strings.strings), decode(parent2.iter(), &strings.strings)));
+    println!(
+        "found {}, {:#}, {:#}, {:#}, {:#}, {:#}, {:#}, {:#}",
+        left,
+        decode(strings.files[left].iter(), &strings.strings),
+        decode(strings.files[left - 1].iter(), &strings.strings),
+        decode(strings.files[left + 1].iter(), &strings.strings),
+
+        decode(strings.files[left_top].iter(), &strings.strings),
+        decode(strings.files[left_top - 1].iter(), &strings.strings),
+        decode(strings.files[left_top - 2].iter(), &strings.strings),
+        decode(strings.files[min(left_top + 1, strings.files.len())].iter(), &strings.strings)
+    );
+
+    let mut i_l = strings.files[left..left_top].iter();
+    let mut i_r = strings.files[right..right_top].iter();
+
+    let mut common: u32 = 0;
+    let mut left_only: u32 = 0;
+    let mut right_only: u32 = 0;
+    let mut l = i_l.next();
+    let mut r = i_r.next();
+    loop {
+        if l.is_none() && r.is_none() {
+            break;
+        }
+        if l.is_none() {
+            while r.is_some() {
+                right_only += 1;
+                r = i_r.next();
+            }
+            break;
+        }
+        if r.is_none() {
+            while l.is_some() {
+                left_only += 1;
+                l = i_l.next();
+            }
+            break;
+        }
+        let ll = l.unwrap();
+        let rr = r.unwrap();
+        match compare_file_entry_iters(ll.iter().skip(parent1.len()), rr.iter().skip(parent2.len())) {
+            Ordering::Less => {
+                left_only += 1;
+                l = i_l.next();
+            }
+            Ordering::Greater => {
+                right_only += 1;
+                r = i_r.next();
+            }
+            Ordering::Equal => {
+                common += 1;
+                l = i_l.next();
+                r = i_r.next();
+            }
+        }
+    }
+    println!("c: {} l: {} r: {}", common, left_only, right_only);
 }
