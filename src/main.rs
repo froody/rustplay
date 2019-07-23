@@ -14,7 +14,8 @@ extern crate superslice;
 
 use byteorder::{LittleEndian, ReadBytesExt};
 use istring::IString;
-use superslice::Ext;
+//use superslice::Ext;
+use sorted_iterator::Ext;
 
 type FileList = Vec<Vec<u32>>;
 
@@ -38,22 +39,12 @@ where
     }
 }
 
-fn compare_file_entry(a: &Vec<u32>, b: &Vec<u32>) -> Ordering {
-    let alen = a.len();
-    let blen = b.len();
-    for i in 0..min(alen, blen) {
-        if a[i] == b[i] {
-            continue;
-        } else {
-            return a[i].cmp(&b[i]);
-        }
-    }
-
-    return alen.cmp(&blen);
+fn compare_file_entry(a: &[u32], b: &[u32]) -> Ordering {
+    compare_file_entry_iters(a.iter(), b.iter())
 }
 
 fn sort_vec32(list: &mut FileList) {
-    list.sort_by(compare_file_entry);
+    list.sort_by(|a, b| compare_file_entry(&a[..], &b[..]));
 }
 
 impl Files {
@@ -282,8 +273,8 @@ fn main() {
         if commonlen > 1 {
             let key = (
                 strings.strings[this[commonlen - 1] as usize].clone(),
-                &this[commonlen-1..],
-                &next[commonlen-1..],
+                &this[commonlen - 1..],
+                &next[commonlen - 1..],
             );
             let entry = stats.groups.entry(key.clone()).or_insert(0);
             *entry += 1;
@@ -318,23 +309,45 @@ fn main() {
     let mut parent2 = parent2.to_vec();
     parent2.reverse();
 
-    let left = strings.files[..].lower_bound_by(|val| compare_file_entry(&val, &parent1));
-    let right = strings.files[..].lower_bound_by(|val| compare_file_entry(&val, &parent2));
-    let left_top = strings.files[..].upper_bound_by(|val| { let prefix = &val[0..min(val.len(), parent1.len())]; compare_file_entry_iters(prefix.iter(), parent1.iter()) } );
-    let right_top = strings.files[..].upper_bound_by(|val| { let prefix = &val[0..min(val.len(), parent2.len())]; compare_file_entry_iters(prefix.iter(), parent2.iter()) } );
-    println!("found {:?}", (left, left_top, right, right_top, strings.files.len()));
-    println!("parents {:?}", ( decode(parent1.iter(), &strings.strings), decode(parent2.iter(), &strings.strings)));
+    fn bounds_of_prefix(prefix: &Vec<u32>, haystack: &Vec<Vec<u32>>) -> (usize, usize) {
+        let bottom = haystack
+            .iter()
+            .lower_bound_by(|val| compare_file_entry(&val, &prefix));
+        let prefix_len = prefix.len();
+        let top = bottom
+            + haystack.iter().skip(bottom).upper_bound_by(|val| {
+                compare_file_entry(&val[0..min(val.len(), prefix_len)], &prefix)
+            });
+        (bottom, top)
+    }
+    let before = Instant::now();
+    let (left, left_top) = bounds_of_prefix(&parent1, &strings.files);
+    let (right, right_top) = bounds_of_prefix(&parent2, &strings.files);
+    println!(
+        "found after {}, {:?}",
+            before.elapsed().as_nanos(),
+        (left, left_top, right, right_top, strings.files.len())
+    );
+    println!(
+        "parents {:?}",
+        (
+            decode(parent1.iter(), &strings.strings),
+            decode(parent2.iter(), &strings.strings)
+        )
+    );
     println!(
         "found {}, {:#}, {:#}, {:#}, {:#}, {:#}, {:#}, {:#}",
         left,
         decode(strings.files[left].iter(), &strings.strings),
         decode(strings.files[left - 1].iter(), &strings.strings),
         decode(strings.files[left + 1].iter(), &strings.strings),
-
         decode(strings.files[left_top].iter(), &strings.strings),
         decode(strings.files[left_top - 1].iter(), &strings.strings),
         decode(strings.files[left_top - 2].iter(), &strings.strings),
-        decode(strings.files[min(left_top + 1, strings.files.len())].iter(), &strings.strings)
+        decode(
+            strings.files[min(left_top + 1, strings.files.len())].iter(),
+            &strings.strings
+        )
     );
 
     let mut i_l = strings.files[left..left_top].iter();
@@ -365,7 +378,8 @@ fn main() {
         }
         let ll = l.unwrap();
         let rr = r.unwrap();
-        match compare_file_entry_iters(ll.iter().skip(parent1.len()), rr.iter().skip(parent2.len())) {
+        match compare_file_entry_iters(ll.iter().skip(parent1.len()), rr.iter().skip(parent2.len()))
+        {
             Ordering::Less => {
                 left_only += 1;
                 l = i_l.next();
