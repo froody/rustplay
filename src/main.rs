@@ -313,10 +313,9 @@ fn main() {
         let bottom = haystack
             .iter()
             .lower_bound_by(|val| compare_file_entry(&val, &prefix));
-        let prefix_len = prefix.len();
         let top = bottom
             + haystack.iter().skip(bottom).upper_bound_by(|val| {
-                compare_file_entry(&val[0..min(val.len(), prefix_len)], &prefix)
+                compare_file_entry(&val[0..min(val.len(), prefix.len())], &prefix)
             });
         (bottom, top)
     }
@@ -325,7 +324,7 @@ fn main() {
     let (right, right_top) = bounds_of_prefix(&parent2, &strings.files);
     println!(
         "found after {}, {:?}",
-            before.elapsed().as_nanos(),
+        before.elapsed().as_nanos(),
         (left, left_top, right, right_top, strings.files.len())
     );
     println!(
@@ -352,48 +351,17 @@ fn main() {
 
     let mut i_l = strings.files[left..left_top].iter();
     let mut i_r = strings.files[right..right_top].iter();
+    let mut common = 0;
+    let mut left_only = 0;
+    let mut right_only = 0;
 
-    let mut common: u32 = 0;
-    let mut left_only: u32 = 0;
-    let mut right_only: u32 = 0;
-    let mut l = i_l.next();
-    let mut r = i_r.next();
-    loop {
-        if l.is_none() && r.is_none() {
-            break;
-        }
-        if l.is_none() {
-            while r.is_some() {
-                right_only += 1;
-                r = i_r.next();
-            }
-            break;
-        }
-        if r.is_none() {
-            while l.is_some() {
-                left_only += 1;
-                l = i_l.next();
-            }
-            break;
-        }
-        let ll = l.unwrap();
-        let rr = r.unwrap();
-        match compare_file_entry_iters(ll.iter().skip(parent1.len()), rr.iter().skip(parent2.len()))
-        {
-            Ordering::Less => {
-                left_only += 1;
-                l = i_l.next();
-            }
-            Ordering::Greater => {
-                right_only += 1;
-                r = i_r.next();
-            }
-            Ordering::Equal => {
-                common += 1;
-                l = i_l.next();
-                r = i_r.next();
-            }
-        }
-    }
-    println!("c: {} l: {} r: {}", common, left_only, right_only);
+    let before = Instant::now();
+    i_l.set_differences_by(
+        &mut i_r,
+        |a, b| compare_file_entry_iters(a.iter().skip(parent1.len()), b.iter().skip(parent2.len())),
+        |_| left_only += 1,
+        |_| right_only += 1,
+        |_, _| common += 1,
+    );
+    println!("afer {} c: {} l: {} r: {}", before.elapsed().as_nanos(), common, left_only, right_only);
 }
