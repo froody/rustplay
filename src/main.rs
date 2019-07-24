@@ -10,19 +10,19 @@ mod sorted_iterator;
 extern crate byteorder;
 extern crate istring;
 extern crate itertools;
-extern crate superslice;
+extern crate rayon;
 
 use byteorder::{LittleEndian, ReadBytesExt};
 use istring::IString;
-//use superslice::Ext;
+use rayon::prelude::*;
 use sorted_iterator::Ext;
 
 type FileList = Vec<Vec<u32>>;
 
 #[derive(Default)]
 struct Files {
-    strings: Vec<IString>,
-    strings_map: HashMap<IString, u32>,
+    strings: Vec<String>,
+    strings_map: HashMap<String, u32>,
     files: FileList,
     files_rev: FileList,
 }
@@ -48,7 +48,12 @@ fn sort_vec32(list: &mut FileList) {
 }
 
 impl Files {
-    fn new(strings: Vec<IString>, strings_map: HashMap<IString, u32>, files: FileList) -> Files {
+    fn new(
+        strings: Vec<String>,
+        strings_map: HashMap<String, u32>,
+        files: FileList,
+        files_rev: FileList,
+    ) -> Files {
         eprintln!("loaded!");
 
         for i in 1..10 {
@@ -67,39 +72,25 @@ impl Files {
             eprintln!("rcounted! {}, {:?}, {}", skiplen, val.next(), after);
         }
 
-        let files_rev = files
-            .iter()
-            .map(|f| {
-                let mut ret = f.clone();
-                ret.reverse();
-                ret
-            })
-            .collect();
-
-        eprintln!("reversed!");
+        let mut files_rev = files_rev;
         let before = Instant::now();
 
-        let slice = vec![files, files_rev];
-        type JH = JoinHandle<FileList>;
+        files_rev
+            .par_chunks_mut(100)
+            .for_each(|c: &mut [Vec<u32>]| {
+                c.iter_mut().for_each(|f: &mut Vec<u32>| {
+                    f.reverse();
+                });
+            });
 
-        let threads: Vec<JH> = slice
-            .into_iter()
-            .map(move |mut arg| -> JH {
-                spawn(move || -> FileList {
-                    let tbef = Instant::now();
-                    sort_vec32(&mut arg);
-                    eprintln!("sorted a {}", tbef.elapsed().as_millis());
-                    arg
-                })
-            })
-            .collect();
+        eprintln!("reversed! {}", before.elapsed().as_millis());
+        let before = Instant::now();
 
-        let mut result: Vec<FileList> = threads
-            .into_iter()
-            .map(move |t| t.join().unwrap())
-            .collect();
-        let files_rev = result.pop().unwrap();
-        let files = result.pop().unwrap();
+        let mut files = files;
+
+        files.par_sort_by(|a, b| compare_file_entry(&a[..], &b[..]));
+        files_rev.par_sort_by(|a, b| compare_file_entry(&a[..], &b[..]));
+
         // eprintln!("nothreads!");
         // let mut files = files;
         // let mut files_rev = files_rev;
@@ -125,8 +116,9 @@ fn load_file_list_from_text<'a>(filename: &String) -> Result<Files, io::Error> {
     let mut buf: Vec<u8> = Vec::new();
     let mut i = 0;
     let mut strings_map = HashMap::new();
-    let mut strings: Vec<IString> = vec![];
+    let mut strings: Vec<String> = vec![];
     let mut files: Vec<Vec<u32>> = vec![];
+    let mut files_rev: Vec<Vec<u32>> = vec![];
     let mut next_string_index: u32 = 0;
     loop {
         buf.clear();
@@ -137,7 +129,7 @@ fn load_file_list_from_text<'a>(filename: &String) -> Result<Files, io::Error> {
         let cursor = io::Cursor::new(&buf);
         let splits = cursor
             .split(b'/')
-            .map(|s| IString::from_utf8(s.unwrap()).unwrap());
+            .map(|s| String::from_utf8(s.unwrap()).unwrap());
         i += 1;
         let file_bits: Vec<u32> = splits
             .map(|component| -> u32 {
@@ -152,7 +144,8 @@ fn load_file_list_from_text<'a>(filename: &String) -> Result<Files, io::Error> {
                     .clone()
             })
             .collect();
-        files.push(file_bits);
+        files.push(file_bits.clone());
+        files_rev.push(file_bits);
         if i % 1000000 == 0 {
             //let joined : String = itertools::join(tmpiter2, "!");
             //println!("path: {}, {:?}, {:?}", i, str::from_utf8(&buf).unwrap(), joined);
@@ -160,15 +153,16 @@ fn load_file_list_from_text<'a>(filename: &String) -> Result<Files, io::Error> {
         }
     }
 
-    return Ok(Files::new(strings, strings_map, files));
+    return Ok(Files::new(strings, strings_map, files, files_rev));
 }
 
 fn load_file_list_from_binary<'a>(
     filenames_path: &String,
     files_path: &String,
 ) -> Result<Files, io::Error> {
-    let mut strings: Vec<IString> = vec![];
+    let mut strings: Vec<String> = vec![];
     let mut files: Vec<Vec<u32>> = vec![];
+    let mut files_rev: Vec<Vec<u32>> = vec![];
     let strings_map = HashMap::new();
 
     // Indices start from 1, so add dummy item
@@ -185,7 +179,8 @@ fn load_file_list_from_binary<'a>(
     loop {
         match filebuf.read_u32::<LittleEndian>() {
             Ok(0) => {
-                files.push(file_buf);
+                files.push(file_buf.clone());
+                files_rev.push(file_buf);
                 file_buf = vec![]
             }
             Ok(value) => {
@@ -200,14 +195,14 @@ fn load_file_list_from_binary<'a>(
             println!("item is {:?}", string);
         }
     }
-    return Ok(Files::new(strings, strings_map, files));
+    return Ok(Files::new(strings, strings_map, files, files_rev));
 }
 
 fn common_prefix(a: &Vec<u32>, b: &Vec<u32>) -> usize {
     a.iter().zip(b).take_while(|(x, y)| x == y).count()
 }
 
-fn decode<'a, I: Iterator<Item = &'a u32>>(item: I, strings: &Vec<IString>) -> String {
+fn decode<'a, I: Iterator<Item = &'a u32>>(item: I, strings: &Vec<String>) -> String {
     itertools::join(
         item.map(|i| -> String { strings[*i as usize].clone().into() }),
         "/",
@@ -227,9 +222,9 @@ fn print_debug_info(files: &Files) {
         println!("item is {:?}", item);
     }
     for item in files.files.iter().take(10) {
-        let thing: Vec<IString> = item
+        let thing: Vec<String> = item
             .iter()
-            .map(|i| -> IString { files.strings[*i as usize].clone() })
+            .map(|i| -> String { files.strings[*i as usize].clone() })
             .collect();
         println!("item is {:?}, {:?}", item, thing);
     }
@@ -244,13 +239,39 @@ fn print_debug_info(files: &Files) {
 #[derive(Default)]
 struct Stats<'a> {
     counts: HashMap<usize, u32>,
-    groups: HashMap<(IString, &'a [u32], &'a [u32]), usize>,
+    groups: HashMap<(String, &'a [u32], &'a [u32]), usize>,
+}
+
+fn compare_adjacent<'a>(
+    this: &'a Vec<u32>,
+    next: &'a Vec<u32>,
+    strings: &Files,
+    stats: &mut Stats<'a>,
+) {
+    let mut last: String = strings.strings[this[0] as usize].clone().into();
+    last = last.to_lowercase();
+    if !(last.ends_with(".jpg") || last.ends_with(".jpeg")) {
+        //continue;
+    }
+    let commonlen = common_prefix(this, next);
+    if commonlen == 0 {
+        return;
+    }
+    let entry = stats.counts.entry(commonlen).or_insert(0);
+    *entry += 1;
+    if commonlen > 1 {
+        let key: (String, &'a [u32], &'a [u32]) = (
+            strings.strings[this[commonlen - 1] as usize].clone(),
+            &this[commonlen - 1..],
+            &next[commonlen - 1..],
+        );
+        let entry = stats.groups.entry(key).or_insert(0);
+        *entry += 1;
+    }
 }
 
 fn main() {
     let args: Vec<String> = env::args().collect();
-
-    let mut stats: Stats = Default::default();
 
     let strings: Files = load_file(&args[1..]).unwrap();
 
@@ -258,37 +279,48 @@ fn main() {
         print_debug_info(&strings);
     }
 
-    for (this, next) in strings.files_rev.iter().zip(&strings.files_rev[1..]) {
-        let mut last: String = strings.strings[this[0] as usize].clone().into();
-        last = last.to_lowercase();
-        if !(last.ends_with(".jpg") || last.ends_with(".jpeg")) {
-            //continue;
+    let before = Instant::now();
+    let mut file_pairs: Vec<(&Vec<u32>, &Vec<u32>)> = strings
+        .files_rev
+        .iter()
+        .zip(&strings.files_rev[1..])
+        .collect();
+
+    let files_ref = &strings;
+    let stats_chunks: Vec<Stats> = file_pairs
+        .par_chunks(100)
+        .map(|chunk| -> Stats {
+            let mut local_stats: Stats = Default::default();
+            for (this, next) in chunk {
+                compare_adjacent(this, next, files_ref, &mut local_stats);
+            }
+            local_stats
+        })
+        .collect();
+    eprintln!("mapped! {}", before.elapsed().as_millis());
+    let before = Instant::now();
+    let mut stats: Stats = Default::default();
+    for chunk in stats_chunks {
+        for (key, value) in chunk.counts {
+            *stats.counts.entry(key).or_insert(0) += value;
         }
-        let commonlen = common_prefix(this, next);
-        if commonlen == 0 {
-            continue;
-        }
-        let entry = stats.counts.entry(commonlen).or_insert(0);
-        *entry += 1;
-        if commonlen > 1 {
-            let key = (
-                strings.strings[this[commonlen - 1] as usize].clone(),
-                &this[commonlen - 1..],
-                &next[commonlen - 1..],
-            );
-            let entry = stats.groups.entry(key.clone()).or_insert(0);
-            *entry += 1;
+        for (key, value) in chunk.groups {
+            *stats.groups.entry(key).or_insert(0) += value;
         }
     }
+    eprintln!("reduced! {}", before.elapsed().as_millis());
+    let before = Instant::now();
+
     for item in stats.counts.iter() {
         println!("hist is {:?}", item);
     }
-    let mut ordered_groups: Vec<(usize, (IString, &[u32], &[u32]))> = stats
+    let mut ordered_groups: Vec<(usize, (String, &[u32], &[u32]))> = stats
         .groups
         .iter()
         .map(|(key, val)| (*val, key.clone()))
         .collect();
-    ordered_groups.sort();
+    ordered_groups.par_sort();
+    eprintln!("sorted groups! {}", before.elapsed().as_millis());
     for (val, key) in &ordered_groups {
         let (name, parent1, parent2) = key;
         println!(
@@ -363,5 +395,11 @@ fn main() {
         |_| right_only += 1,
         |_, _| common += 1,
     );
-    println!("afer {} c: {} l: {} r: {}", before.elapsed().as_nanos(), common, left_only, right_only);
+    println!(
+        "afer {} c: {} l: {} r: {}",
+        before.elapsed().as_nanos(),
+        common,
+        left_only,
+        right_only
+    );
 }
